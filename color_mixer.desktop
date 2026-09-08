@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=color_mixer
+X-Python-2-Compatible=false
+X-Krita-Version=28
+Name=Mezclador de colores
+Comment=Calcula la mezcla de colores de tu paleta que iguala el color objetivo
