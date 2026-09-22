@@ -1,5 +1,7 @@
-from PyQt5.QtCore import QRect, QSettings, QSize, Qt, QTimer
+import os
 import traceback
+
+from PyQt5.QtCore import QRect, QSettings, QSize, QStandardPaths, Qt, QTimer
 from PyQt5.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QColorDialog,
@@ -9,6 +11,7 @@ from PyQt5.QtWidgets import (
     QDockWidget,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -86,6 +89,102 @@ def _to_qcolor(value, view=None):
     except Exception:
         pass
     return None
+
+
+def _palette_directory():
+    candidates = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        candidates.append(os.path.join(appdata, "krita", "palettes"))
+    try:
+        location = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        if location:
+            candidates.append(os.path.join(location, "palettes"))
+    except Exception:
+        pass
+    try:
+        resources = Krita.instance().resources("palette")
+        for resource in resources.values():
+            try:
+                filename = resource.filename()
+            except Exception:
+                continue
+            if filename and filename.lower().endswith((".gpl", ".kpl")):
+                directory = os.path.dirname(filename)
+                if directory and directory not in candidates:
+                    candidates.append(directory)
+    except Exception:
+        pass
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            os.makedirs(candidate)
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _safe_filename(name):
+    cleaned = "".join(
+        "_" if ch in '<>:"/\\|?*' else ch for ch in name).strip().strip(".")
+    return cleaned or "paleta"
+
+
+def _palette_path(name):
+    directory = _palette_directory()
+    if not directory:
+        return None
+    return os.path.join(directory, _safe_filename(name) + ".gpl")
+
+
+def _write_palette_file(path, name, palette):
+    lines = [
+        "GIMP Palette",
+        "Name: %s" % name,
+        "Columns: 16",
+        "#",
+    ]
+    for entry_name, color in palette:
+        lines.append("%d %d %d\t%s" % (
+            color.red(), color.green(), color.blue(), entry_name))
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def _read_palette_file(path):
+    colors = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except Exception:
+        return colors
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        lowered = line.lower()
+        if (lowered.startswith("gimp palette")
+                or lowered.startswith("name:")
+                or lowered.startswith("columns:")):
+            continue
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        try:
+            r, g, b = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
+            continue
+        color = QColor(r, g, b)
+        if color.isValid():
+            colors.append(color)
+    return colors
 
 
 class StandardColorsDialog(QDialog):
@@ -232,10 +331,17 @@ class ColorMixerPanel(QWidget):
         row2.addWidget(self.btn_clear)
         palette_layout.addLayout(row2)
 
-        palette_layout.addWidget(QLabel("<b>Importar paleta de Krita:</b>"))
+        palette_layout.addWidget(QLabel("<b>Paletas de Krita:</b>"))
+        palette_row = QHBoxLayout()
         self.cmb_palettes = QComboBox()
         self.cmb_palettes.currentIndexChanged.connect(self._import_palette)
-        palette_layout.addWidget(self.cmb_palettes)
+        self.btn_save_palette = QPushButton("Guardar...")
+        self.btn_save_palette.setToolTip(
+            "Guardar la paleta actual como una paleta de Krita")
+        self.btn_save_palette.clicked.connect(self._save_palette)
+        palette_row.addWidget(self.cmb_palettes, 1)
+        palette_row.addWidget(self.btn_save_palette)
+        palette_layout.addLayout(palette_row)
         self.splitter.addWidget(palette_widget)
 
         result_widget = QWidget()
@@ -354,14 +460,67 @@ class ColorMixerPanel(QWidget):
     def _import_palette(self, index):
         if index <= 0:
             return
-        resource = self.cmb_palettes.itemData(index)
-        colors = self._resource_colors(resource)
+        data = self.cmb_palettes.itemData(index)
+        if isinstance(data, tuple):
+            colors = _read_palette_file(data[1])
+        else:
+            colors = self._resource_colors(data)
         if not colors:
             QMessageBox.information(self, "Paleta", "No se pudieron leer los colores de esta paleta.")
             return
         self._palette = [(color.name().upper(), color) for color in colors]
         self._palette_changed()
         self.cmb_palettes.blockSignals(True)
+        self.cmb_palettes.setCurrentIndex(0)
+        self.cmb_palettes.blockSignals(False)
+
+    def _save_palette(self):
+        if not self._palette:
+            QMessageBox.information(
+                self, "Guardar paleta",
+                "Añade colores a la paleta antes de guardarla.")
+            return
+        name, accepted = QInputDialog.getText(
+            self, "Guardar paleta", "Nombre de la paleta:",
+            QLineEdit.Normal, "Mi paleta")
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(
+                self, "Guardar paleta", "El nombre no puede estar vacío.")
+            return
+        path = _palette_path(name)
+        if not path:
+            QMessageBox.critical(
+                self, "Guardar paleta",
+                "No se encontró la carpeta de paletas de Krita.")
+            return
+        if os.path.exists(path):
+            confirm = QMessageBox.question(
+                self, "Guardar paleta",
+                "Ya existe una paleta llamada «%s». ¿Quieres reemplazarla?" % name,
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if confirm != QMessageBox.Yes:
+                return
+        try:
+            _write_palette_file(path, name, self._palette)
+        except Exception:
+            QMessageBox.critical(
+                self, "Guardar paleta",
+                "No se pudo guardar la paleta:\n%s" % traceback.format_exc())
+            return
+        self._register_saved_palette(name, path)
+        QMessageBox.information(
+            self, "Guardar paleta",
+            "Paleta «%s» guardada. Ya está disponible en Krita y en esta lista." % name)
+
+    def _register_saved_palette(self, name, path):
+        self.cmb_palettes.blockSignals(True)
+        for i in range(self.cmb_palettes.count() - 1, 0, -1):
+            if self.cmb_palettes.itemText(i) == name:
+                self.cmb_palettes.removeItem(i)
+        self.cmb_palettes.insertItem(1, name, ("file", path))
         self.cmb_palettes.setCurrentIndex(0)
         self.cmb_palettes.blockSignals(False)
 
