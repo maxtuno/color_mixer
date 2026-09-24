@@ -24,7 +24,13 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from krita import DockWidget, DockWidgetFactory, DockWidgetFactoryBase, Krita
+from krita import (
+    DockWidget,
+    DockWidgetFactory,
+    DockWidgetFactoryBase,
+    Krita,
+    Palette,
+)
 
 from . import mixing
 from .color_data import STANDARD_COLORS
@@ -280,6 +286,7 @@ class ColorMixerPanel(QWidget):
         super().__init__(parent)
         self.setMinimumWidth(300)
         self._palette = []
+        self._dirty = False
         self._target = QColor(128, 128, 128)
         self._last_foreground = None
         self._analyze_timer = QTimer(self)
@@ -414,6 +421,7 @@ class ColorMixerPanel(QWidget):
         self._palette_changed()
 
     def _palette_changed(self):
+        self._dirty = True
         self._refresh_palette_list()
         self._save_state()
         self._schedule_analysis()
@@ -439,10 +447,6 @@ class ColorMixerPanel(QWidget):
         self.cmb_palettes.blockSignals(False)
 
     def _resource_colors(self, resource):
-        try:
-            entries = resource.colors()
-        except Exception:
-            return []
         view = None
         try:
             window = Krita.instance().activeWindow()
@@ -450,15 +454,67 @@ class ColorMixerPanel(QWidget):
                 view = window.activeView()
         except Exception:
             view = None
+        colors = self._palette_colors(resource, view)
+        if colors:
+            return colors
+        return self._legacy_resource_colors(resource, view)
+
+    def _palette_colors(self, resource, view):
+        try:
+            palette = Palette(resource)
+            count = palette.numberOfEntries()
+        except Exception:
+            return []
         colors = []
-        for entry in entries:
-            color = _to_qcolor(entry, view)
-            if color is not None and color.alpha() > 0:
+        for index in range(count):
+            try:
+                swatch = palette.entryByIndex(index)
+            except Exception:
+                continue
+            try:
+                managed = swatch.color()
+            except Exception:
+                managed = None
+            color = _to_qcolor(managed, view)
+            if color is not None and color.isValid() and color.alpha() > 0:
                 colors.append(color)
         return colors
 
+    def _legacy_resource_colors(self, resource, view):
+        try:
+            entries = resource.colors()
+        except Exception:
+            return []
+        colors = []
+        for entry in entries:
+            color = _to_qcolor(entry, view)
+            if color is not None and color.isValid() and color.alpha() > 0:
+                colors.append(color)
+        return colors
+
+    def _reset_palette_selector(self):
+        self.cmb_palettes.blockSignals(True)
+        self.cmb_palettes.setCurrentIndex(0)
+        self.cmb_palettes.blockSignals(False)
+
+    def _confirm_palette_change(self):
+        if not self._dirty or not self._palette:
+            return True
+        answer = QMessageBox.question(
+            self, "Paleta modificada",
+            "La paleta actual tiene cambios sin guardar.\n"
+            "¿Quieres guardarla antes de cargar otra paleta?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save)
+        if answer == QMessageBox.Save:
+            return self._save_palette()
+        return answer == QMessageBox.Discard
+
     def _import_palette(self, index):
         if index <= 0:
+            return
+        if not self._confirm_palette_change():
+            self._reset_palette_selector()
             return
         data = self.cmb_palettes.itemData(index)
         if isinstance(data, tuple):
@@ -467,53 +523,55 @@ class ColorMixerPanel(QWidget):
             colors = self._resource_colors(data)
         if not colors:
             QMessageBox.information(self, "Paleta", "No se pudieron leer los colores de esta paleta.")
+            self._reset_palette_selector()
             return
         self._palette = [(color.name().upper(), color) for color in colors]
         self._palette_changed()
-        self.cmb_palettes.blockSignals(True)
-        self.cmb_palettes.setCurrentIndex(0)
-        self.cmb_palettes.blockSignals(False)
+        self._dirty = False
+        self._reset_palette_selector()
 
     def _save_palette(self):
         if not self._palette:
             QMessageBox.information(
                 self, "Guardar paleta",
                 "Añade colores a la paleta antes de guardarla.")
-            return
+            return False
         name, accepted = QInputDialog.getText(
             self, "Guardar paleta", "Nombre de la paleta:",
             QLineEdit.Normal, "Mi paleta")
         if not accepted:
-            return
+            return False
         name = name.strip()
         if not name:
             QMessageBox.warning(
                 self, "Guardar paleta", "El nombre no puede estar vacío.")
-            return
+            return False
         path = _palette_path(name)
         if not path:
             QMessageBox.critical(
                 self, "Guardar paleta",
                 "No se encontró la carpeta de paletas de Krita.")
-            return
+            return False
         if os.path.exists(path):
             confirm = QMessageBox.question(
                 self, "Guardar paleta",
                 "Ya existe una paleta llamada «%s». ¿Quieres reemplazarla?" % name,
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
             if confirm != QMessageBox.Yes:
-                return
+                return False
         try:
             _write_palette_file(path, name, self._palette)
         except Exception:
             QMessageBox.critical(
                 self, "Guardar paleta",
                 "No se pudo guardar la paleta:\n%s" % traceback.format_exc())
-            return
+            return False
         self._register_saved_palette(name, path)
+        self._dirty = False
         QMessageBox.information(
             self, "Guardar paleta",
             "Paleta «%s» guardada. Ya está disponible en Krita y en esta lista." % name)
+        return True
 
     def _register_saved_palette(self, name, path):
         self.cmb_palettes.blockSignals(True)
